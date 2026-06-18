@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: rocket-fuel-simulation
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/rocket_simulation
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+logging:
+  level:
+    com.rocket.simulation: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: INFO
