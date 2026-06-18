@@ -2,6 +2,7 @@ package com.rocket.simulation.service;
 
 import com.rocket.simulation.dto.SimulationRequest;
 import com.rocket.simulation.dto.SimulationResult;
+import com.rocket.simulation.dto.SimulationResult.SafetyViolation;
 import com.rocket.simulation.dto.SimulationResult.ThrustPoint;
 import org.springframework.stereotype.Service;
 
@@ -22,6 +23,12 @@ public class PropulsionCalculationService {
     private static final int MAX_MACH_ITERATIONS = 100;
     private static final double MACH_TOLERANCE = 1e-6;
     private static final int MAX_THRUST_POINTS = 2000;
+
+    private static final double SAFETY_MAX_TEMP_CONTINUOUS = 3000.0;
+    private static final double SAFETY_MAX_TEMP_DURATION = 3.0;
+    private static final double SAFETY_MAX_TEMP_PEAK = 3500.0;
+    private static final double SAFETY_MAX_THRUST_RISE_RATE = 0.5;
+    private static final double SAFETY_THRUST_FLUCTUATION = 0.15;
 
     private static class CombustionResult {
         double temperature;
@@ -76,7 +83,7 @@ public class PropulsionCalculationService {
         double thrustCoeffDenominator = chamberPressure * 1_000_000 * throatArea;
         double thrustCoefficient = thrust / Math.max(thrustCoeffDenominator, MIN_FINITE);
 
-        List<ThrustPoint> thrustCurve = generateThrustCurve(
+        CurveData curveData = generateThrustCurveWithTemp(
                 thrust,
                 massFlowRate,
                 combustion,
@@ -84,6 +91,8 @@ public class PropulsionCalculationService {
                 burnDuration,
                 nozzleAreaRatio
         );
+
+        List<ThrustPoint> thrustCurve = curveData.points;
 
         double maxThrust_N = thrustCurve.stream()
                 .mapToDouble(ThrustPoint::getThrust)
@@ -101,12 +110,21 @@ public class PropulsionCalculationService {
         for (ThrustPoint point : thrustCurve) {
             double thrust_kN = point.getThrust() / 1000.0;
             thrust_kN = round2(thrust_kN);
-            thrustCurve_kN.add(new ThrustPoint(point.getTime(), thrust_kN));
+            ThrustPoint p = new ThrustPoint(point.getTime(), thrust_kN);
+            p.setTemperature(point.getTemperature());
+            thrustCurve_kN.add(p);
         }
 
         double maxThrust_kN = round2(maxThrust_N / 1000.0);
         double averageThrust_kN = round2(averageThrust_N / 1000.0);
         double totalImpulse_kNs = round2(totalImpulse_Ns / 1000.0);
+
+        List<SafetyViolation> safetyViolations = performSafetyAssessment(thrustCurve, burnDuration,
+                SAFETY_MAX_TEMP_CONTINUOUS, SAFETY_MAX_TEMP_DURATION, SAFETY_MAX_TEMP_PEAK,
+                curveData.steadyThrust, SAFETY_THRUST_FLUCTUATION);
+
+        boolean compliant = safetyViolations.isEmpty();
+        String summary = buildSafetySummary(compliant, safetyViolations);
 
         SimulationResult result = new SimulationResult();
         result.setRecipeId(recipeId);
@@ -123,6 +141,9 @@ public class PropulsionCalculationService {
         result.setExitTemperature(round2(exitTemp));
         result.setExitPressure(round4(exitPressure));
         result.setThrustCurve(thrustCurve_kN);
+        result.setSafetyCompliant(compliant);
+        result.setSafetyViolations(safetyViolations);
+        result.setSafetySummary(summary);
 
         return result;
     }
@@ -413,15 +434,25 @@ public class PropulsionCalculationService {
         return Math.max(thrust, 0.0);
     }
 
-    private List<ThrustPoint> generateThrustCurve(double steadyThrust, double massFlowRate,
+    private static class CurveData {
+        List<SimulationResult.ThrustPoint> points;
+        double steadyThrust;
+        double nominalTemp;
+    }
+
+    private CurveData generateThrustCurveWithTemp(double steadyThrust, double massFlowRate,
                                                   CombustionResult combustion, double chamberPressure,
                                                   double burnDuration, double areaRatio) {
-        List<ThrustPoint> curve = new ArrayList<>();
+        List<SimulationResult.ThrustPoint> curve = new ArrayList<>();
+        CurveData result = new CurveData();
+        result.steadyThrust = steadyThrust;
+        result.nominalTemp = combustion.temperature;
 
         if (!isFinite(burnDuration) || burnDuration <= 0) {
-            curve.add(new ThrustPoint(0.0, 0.0));
-            curve.add(new ThrustPoint(1.0, steadyThrust));
-            return curve;
+            curve.add(new SimulationResult.ThrustPoint(0.0, 0.0, combustion.temperature));
+            curve.add(new SimulationResult.ThrustPoint(1.0, steadyThrust, combustion.temperature));
+            result.points = curve;
+            return result;
         }
 
         int numPoints = (int) Math.min(Math.max(burnDuration * 20 + 1, 10), MAX_THRUST_POINTS);
@@ -451,6 +482,7 @@ public class PropulsionCalculationService {
             }
 
             double thrustMultiplier = 1.0;
+            double timeVaryingTemp = combustion.temperature;
 
             try {
                 if (time < startupTime) {
@@ -486,7 +518,7 @@ public class PropulsionCalculationService {
                 timeFrac = clamp(timeFrac, 0.0, 1.0);
 
                 double tempVariation = 0.99 + 0.02 * Math.sin(2.0 * Math.PI * 3.0 * timeFrac);
-                double timeVaryingTemp = combustion.temperature * tempVariation;
+                timeVaryingTemp = combustion.temperature * tempVariation;
 
                 double cStar = calculateCharacteristicVelocity(
                         timeVaryingTemp, combustion.gamma, combustion.molarMass);
@@ -526,18 +558,25 @@ public class PropulsionCalculationService {
             instantThrust = clamp(instantThrust, 0.0, MAX_REASONABLE_THRUST);
             lastValidThrust = instantThrust;
 
+            if (!isFinite(timeVaryingTemp)) {
+                timeVaryingTemp = combustion.temperature;
+            }
+            timeVaryingTemp = clamp(timeVaryingTemp, 500.0, 5000.0);
+
             double roundedTime = Math.round(time * 1000.0) / 1000.0;
             double roundedThrust = Math.round(instantThrust * 100.0) / 100.0;
+            double roundedTemp = Math.round(timeVaryingTemp * 100.0) / 100.0;
 
-            curve.add(new ThrustPoint(roundedTime, roundedThrust));
+            curve.add(new SimulationResult.ThrustPoint(roundedTime, roundedThrust, roundedTemp));
         }
 
         if (curve.isEmpty()) {
-            curve.add(new ThrustPoint(0.0, 0.0));
-            curve.add(new ThrustPoint(burnDuration, steadyThrust));
+            curve.add(new SimulationResult.ThrustPoint(0.0, 0.0, combustion.temperature));
+            curve.add(new SimulationResult.ThrustPoint(burnDuration, steadyThrust, combustion.temperature));
         }
 
-        return curve;
+        result.points = curve;
+        return result;
     }
 
     private boolean isFinite(double value) {
@@ -570,5 +609,251 @@ public class PropulsionCalculationService {
             return 0.0;
         }
         return Math.round(value * 10000.0) / 10000.0;
+    }
+
+    private List<SafetyViolation> performSafetyAssessment(List<ThrustPoint> curve, double burnDuration,
+                                                          double maxContinuousTemp, double maxTempDuration,
+                                                          double maxPeakTemp,
+                                                          double nominalThrust, double maxFluctuation) {
+        List<SafetyViolation> violations = new ArrayList<>();
+
+        if (curve == null || curve.isEmpty()) {
+            return violations;
+        }
+
+        try {
+            detectContinuousTemperatureViolations(curve, maxContinuousTemp, maxTempDuration, violations);
+        } catch (Exception e) {
+            // skip this check
+        }
+
+        try {
+            detectPeakTemperatureViolations(curve, maxPeakTemp, violations);
+        } catch (Exception e) {
+            // skip
+        }
+
+        try {
+            detectThrustFluctuationViolations(curve, nominalThrust, maxFluctuation, burnDuration, violations);
+        } catch (Exception e) {
+            // skip
+        }
+
+        return violations;
+    }
+
+    private void detectContinuousTemperatureViolations(List<ThrustPoint> curve, double threshold,
+                                                       double minDuration, List<SafetyViolation> out) {
+        int n = curve.size();
+        int runStart = -1;
+        double peakInRun = 0.0;
+
+        for (int i = 0; i < n; i++) {
+            ThrustPoint p = curve.get(i);
+            double temp = p.getTemperature() != null ? p.getTemperature() : 0.0;
+
+            if (temp > threshold) {
+                if (runStart < 0) {
+                    runStart = i;
+                    peakInRun = temp;
+                } else {
+                    peakInRun = Math.max(peakInRun, temp);
+                }
+            } else {
+                if (runStart >= 0) {
+                    double startTime = curve.get(runStart).getTime();
+                    double endTime = curve.get(i - 1).getTime();
+                    double duration = endTime - startTime;
+                    if (duration >= minDuration) {
+                        out.add(SafetyViolation.create(
+                                "TEMPERATURE_CONTINUOUS",
+                                String.format("燃烧室温度连续 %.1fs 超过 %.0f K 红线", duration, threshold),
+                                startTime, endTime,
+                                peakInRun, threshold,
+                                "CRITICAL"
+                        ));
+                    }
+                    runStart = -1;
+                    peakInRun = 0.0;
+                }
+            }
+        }
+
+        if (runStart >= 0) {
+            double startTime = curve.get(runStart).getTime();
+            double endTime = curve.get(n - 1).getTime();
+            double duration = endTime - startTime;
+            if (duration >= minDuration) {
+                out.add(SafetyViolation.create(
+                        "TEMPERATURE_CONTINUOUS",
+                        String.format("燃烧室温度连续 %.1fs 超过 %.0f K 红线", duration, threshold),
+                        startTime, endTime,
+                        peakInRun, threshold,
+                        "CRITICAL"
+                ));
+            }
+        }
+    }
+
+    private void detectPeakTemperatureViolations(List<ThrustPoint> curve, double threshold,
+                                                  List<SafetyViolation> out) {
+        int n = curve.size();
+        int runStart = -1;
+        double peakInRun = 0.0;
+
+        for (int i = 0; i < n; i++) {
+            ThrustPoint p = curve.get(i);
+            double temp = p.getTemperature() != null ? p.getTemperature() : 0.0;
+
+            if (temp > threshold) {
+                if (runStart < 0) {
+                    runStart = i;
+                    peakInRun = temp;
+                } else {
+                    peakInRun = Math.max(peakInRun, temp);
+                }
+            } else {
+                if (runStart >= 0) {
+                    double startTime = curve.get(runStart).getTime();
+                    double endTime = curve.get(i - 1).getTime();
+                    out.add(SafetyViolation.create(
+                            "TEMPERATURE_PEAK",
+                            String.format("燃烧室温度峰值超过 %.0f K 绝对红线", threshold),
+                            startTime, endTime,
+                            peakInRun, threshold,
+                            "DANGER"
+                    ));
+                    runStart = -1;
+                    peakInRun = 0.0;
+                }
+            }
+        }
+
+        if (runStart >= 0) {
+            double startTime = curve.get(runStart).getTime();
+            double endTime = curve.get(n - 1).getTime();
+            out.add(SafetyViolation.create(
+                    "TEMPERATURE_PEAK",
+                    String.format("燃烧室温度峰值超过 %.0f K 绝对红线", threshold),
+                    startTime, endTime,
+                    peakInRun, threshold,
+                    "DANGER"
+            ));
+        }
+    }
+
+    private void detectThrustFluctuationViolations(List<ThrustPoint> curve, double nominalThrust,
+                                                    double maxFluctuation, double burnDuration,
+                                                    List<SafetyViolation> out) {
+        if (nominalThrust <= 0 || curve.size() < 3) {
+            return;
+        }
+
+        double minAllowed = nominalThrust * (1.0 - maxFluctuation);
+        double maxAllowed = nominalThrust * (1.0 + maxFluctuation);
+
+        int n = curve.size();
+        double startupEnd = burnDuration * 0.15;
+        double shutdownStart = burnDuration * 0.85;
+
+        int runStart = -1;
+        double peakDeviation = 0.0;
+        double worstValue = 0.0;
+
+        for (int i = 0; i < n; i++) {
+            ThrustPoint p = curve.get(i);
+            double t = p.getTime();
+            double thrust = p.getThrust() * 1000.0;
+
+            if (t < startupEnd || t > shutdownStart) {
+                continue;
+            }
+
+            boolean outOfRange = thrust < minAllowed || thrust > maxAllowed;
+            double deviation = Math.max(thrust - maxAllowed, minAllowed - thrust);
+
+            if (outOfRange) {
+                if (runStart < 0) {
+                    runStart = i;
+                    peakDeviation = deviation;
+                    worstValue = thrust;
+                } else {
+                    if (deviation > peakDeviation) {
+                        peakDeviation = deviation;
+                        worstValue = thrust;
+                    }
+                }
+            } else {
+                if (runStart >= 0) {
+                    double startTime = curve.get(runStart).getTime();
+                    double endTime = curve.get(i - 1).getTime();
+                    double duration = endTime - startTime;
+                    if (duration >= 0.5) {
+                        double pct = (worstValue / nominalThrust - 1.0) * 100.0;
+                        out.add(SafetyViolation.create(
+                                "THRUST_FLUCTUATION",
+                                String.format("推力波动超出 ±%.0f%% 允许范围 (偏差 %.1f%%)",
+                                        maxFluctuation * 100, pct),
+                                startTime, endTime,
+                                worstValue / 1000.0, nominalThrust / 1000.0,
+                                "WARNING"
+                        ));
+                    }
+                    runStart = -1;
+                    peakDeviation = 0.0;
+                    worstValue = 0.0;
+                }
+            }
+        }
+
+        if (runStart >= 0) {
+            double startTime = curve.get(runStart).getTime();
+            double endTime = curve.get(n - 1).getTime();
+            double duration = endTime - startTime;
+            if (duration >= 0.5) {
+                double pct = (worstValue / nominalThrust - 1.0) * 100.0;
+                out.add(SafetyViolation.create(
+                        "THRUST_FLUCTUATION",
+                        String.format("推力波动超出 ±%.0f%% 允许范围 (偏差 %.1f%%)",
+                                maxFluctuation * 100, pct),
+                        startTime, endTime,
+                        worstValue / 1000.0, nominalThrust / 1000.0,
+                        "WARNING"
+                ));
+            }
+        }
+    }
+
+    private String buildSafetySummary(boolean compliant, List<SafetyViolation> violations) {
+        if (compliant) {
+            return "安全评估结果：合规\n所有参数均在行业标准安全红线范围内。\n";
+        }
+
+        int criticalCount = 0;
+        int dangerCount = 0;
+        int warningCount = 0;
+
+        for (SafetyViolation v : violations) {
+            if ("CRITICAL".equals(v.getSeverity())) criticalCount++;
+            else if ("DANGER".equals(v.getSeverity())) dangerCount++;
+            else warningCount++;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("安全评估结果：不合规\n");
+        sb.append(String.format("发现 %d 项严重违规 (CRITICAL)，%d 项危险 (DANGER)，%d 项警告 (WARNING)。\n",
+                criticalCount, dangerCount, warningCount));
+
+        if (criticalCount > 0) {
+            sb.append("建议：立即调整燃料配比或降低燃烧室压力，避免燃烧室过热导致结构失效。\n");
+        }
+        if (dangerCount > 0) {
+            sb.append("警告：温度峰值超过绝对红线，存在喷管烧蚀风险！\n");
+        }
+        if (warningCount > 0) {
+            sb.append("提示：推力波动较大，建议检查推进剂供应系统稳定性。\n");
+        }
+
+        return sb.toString();
     }
 }

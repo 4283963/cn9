@@ -169,7 +169,55 @@
           <h2 class="section-title">
             <el-icon><DataLine /></el-icon>
             <span>仿真结果 - {{ store.currentResult.recipeName || '预览模式' }}</span>
+            <el-tag
+              v-if="store.currentResult.safetyCompliant === true"
+              type="success"
+              effect="light"
+              size="default"
+              style="margin-left: 12px;"
+            >
+              <el-icon style="margin-right: 4px;"><CircleCheck /></el-icon>
+              安全合规
+            </el-tag>
+            <el-tag
+              v-else-if="store.currentResult.safetyCompliant === false"
+              type="danger"
+              effect="dark"
+              size="default"
+              style="margin-left: 12px;"
+            >
+              <el-icon style="margin-right: 4px;"><WarningFilled /></el-icon>
+              发现安全风险
+            </el-tag>
           </h2>
+
+          <el-alert
+            v-if="store.currentResult.safetyCompliant === false && store.currentResult.safetySummary"
+            :title="safetyAlertTitle"
+            :description="store.currentResult.safetySummary"
+            type="error"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 20px;"
+          >
+            <template #icon>
+              <el-icon :size="20"><WarningFilled /></el-icon>
+            </template>
+          </el-alert>
+
+          <el-alert
+            v-else-if="store.currentResult.safetyCompliant === true"
+            title="安全评估：通过"
+            description="所有参数均在行业标准安全红线范围内，可以进行点火试验。"
+            type="success"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 20px;"
+          >
+            <template #icon>
+              <el-icon :size="20"><CircleCheckFilled /></el-icon>
+            </template>
+          </el-alert>
 
           <el-row :gutter="16" style="margin-bottom: 20px">
             <el-col :span="6">
@@ -210,7 +258,63 @@
             </el-col>
           </el-row>
 
-          <ThrustChart :data="store.currentResult.thrustCurve" />
+          <ThrustChart
+            :data="store.currentResult.thrustCurve"
+            :violations="store.currentResult.safetyViolations || []"
+          />
+
+          <el-collapse v-if="store.currentResult.safetyViolations?.length > 0" style="margin-top: 24px;">
+            <el-collapse-item title="安全违规详细清单" name="violations">
+              <el-table
+                :data="store.currentResult.safetyViolations"
+                stripe
+                border
+                size="small"
+                style="width: 100%"
+              >
+                <el-table-column label="严重程度" width="100" align="center">
+                  <template #default="{ row }">
+                    <el-tag
+                      :type="severityTagType(row.severity)"
+                      effect="dark"
+                      size="small"
+                    >
+                      {{ severityLabel(row.severity) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="违规类型" width="170">
+                  <template #default="{ row }">
+                    {{ violationTypeLabel(row.violationType) }}
+                  </template>
+                </el-table-column>
+                <el-table-column prop="startTime" label="开始时间 (s)" width="120" align="right" />
+                <el-table-column prop="endTime" label="结束时间 (s)" width="120" align="right" />
+                <el-table-column prop="duration" label="持续时间 (s)" width="120" align="right" />
+                <el-table-column label="峰值" width="140" align="right">
+                  <template #default="{ row }">
+                    <span :style="{ color: '#f56c6c', fontWeight: 600 }">
+                      {{ row.peakValue?.toLocaleString() }}
+                    </span>
+                    <span style="color: #909399; margin-left: 2px;">
+                      {{ violationUnit(row.violationType) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="红线阈值" width="140" align="right">
+                  <template #default="{ row }">
+                    <span style="color: #909399;">
+                      {{ row.threshold?.toLocaleString() }}
+                    </span>
+                    <span style="color: #909399; margin-left: 2px;">
+                      {{ violationUnit(row.violationType) }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="description" label="描述说明" min-width="260" />
+              </el-table>
+            </el-collapse-item>
+          </el-collapse>
 
           <el-divider />
 
@@ -273,13 +377,14 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useSimulationStore } from '@/stores/simulation'
 import ThrustChart from '@/components/ThrustChart.vue'
 import {
   Setting, Coin, Odometer, Timer, VideoPlay, View,
-  Refresh, DataLine, Histogram, Van
+  Refresh, DataLine, Histogram, Van,
+  Warning, WarningFilled, CircleCheck, CircleCheckFilled
 } from '@element-plus/icons-vue'
 
 const store = useSimulationStore()
@@ -328,6 +433,57 @@ const rules = {
     { required: true, message: '请输入喷管面积比', trigger: 'blur' },
     { type: 'number', min: 1.0, max: 100.0, message: '范围: 1 - 100', trigger: 'blur' }
   ]
+}
+
+const safetyAlertTitle = computed(() => {
+  const vs = store.currentResult?.safetyViolations || []
+  const critical = vs.filter(v => v.severity === 'CRITICAL').length
+  const danger = vs.filter(v => v.severity === 'DANGER').length
+  const warning = vs.filter(v => v.severity === 'WARNING').length
+  const parts = []
+  if (critical > 0) parts.push(`${critical} 项严重违规`)
+  if (danger > 0) parts.push(`${danger} 项危险`)
+  if (warning > 0) parts.push(`${warning} 项警告`)
+  return `检测到安全风险：${parts.join('，')}！`
+})
+
+function severityTagType(severity) {
+  switch (severity) {
+    case 'CRITICAL': return 'danger'
+    case 'DANGER': return 'warning'
+    case 'WARNING': return 'info'
+    default: return 'info'
+  }
+}
+
+function severityLabel(severity) {
+  switch (severity) {
+    case 'CRITICAL': return '严重'
+    case 'DANGER': return '危险'
+    case 'WARNING': return '警告'
+    default: return severity || '未知'
+  }
+}
+
+function violationTypeLabel(type) {
+  switch (type) {
+    case 'TEMPERATURE_CONTINUOUS': return '燃烧室温度持续超标'
+    case 'TEMPERATURE_PEAK': return '燃烧室温度峰值超标'
+    case 'THRUST_FLUCTUATION': return '推力波动过大'
+    default: return type || '未知违规'
+  }
+}
+
+function violationUnit(type) {
+  switch (type) {
+    case 'TEMPERATURE_CONTINUOUS':
+    case 'TEMPERATURE_PEAK':
+      return 'K'
+    case 'THRUST_FLUCTUATION':
+      return 'kN'
+    default:
+      return ''
+  }
 }
 
 async function handleRunSimulation() {
